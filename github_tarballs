@@ -204,6 +204,14 @@ def get_changes(package, owner, repo, target):
     return data
 
 
+def _check_filenames(*filenames):
+    for filename in filenames:
+        basename = os.path.basename(filename)
+        if os.path.abspath(filename) != os.path.abspath(basename):
+            # no arbitrary filename, please
+            sys.exit("%s: illegal filename" % filename)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Git Tarballs')
     parser.add_argument('--url', required=True,
@@ -228,6 +236,8 @@ if __name__ == '__main__':
         args.filename = args.url.rsplit("/", 1)[1]
     if not args.package:
         args.package = os.getcwd().rsplit("/", 1)[1]
+
+    _check_filenames(args.filename, args.package)
 
     download_tarball(args.url, args.filename)
 
