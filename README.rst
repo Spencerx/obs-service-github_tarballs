@@ -38,6 +38,7 @@ The tests require `python-mock`_. To run them, just use ``nosetests`` or ``pytho
 
 Contributing
 ------------
+This is the git repository for `openSUSE\:Tools/obs-service-github_tarballs`_. The authoritative source is https://github.com/openSUSE/obs-service-github_tarballs.
 
 You can submit or ask for improvements using github's Pull Requests or Issues. If you're sending a patch, please make sure the testsuite is still running and also run flake8 on the files you've modified. It would be great if you could also modify this README file to describe new functionality and add tests.
 
@@ -47,3 +48,5 @@ You can take a look at the .travis.yml file to see how the testsuite and flake8 
 .. _Open Build Service: http://openbuildservice.org/
 .. _github API: http://api.github.com/
 .. _python-mock: http://www.voidspace.org.uk/python/mock/mock.html
+.. _openSUSE\:Tools/obs-service-github_tarballs: https://build.opensuse.org/package/show/openSUSE:Tools/obs-service-github_tarballs
+
