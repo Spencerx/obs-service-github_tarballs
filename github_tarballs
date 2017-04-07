@@ -61,6 +61,7 @@ def download_tarball(url, filename):
 
 
 def get_parent_dir_and_version_from_tarball(tar_name):
+    tar = None
     try:
         tar = tarfile.open(tar_name)
         parent_dir = tar.firstmember.name
@@ -70,7 +71,8 @@ def get_parent_dir_and_version_from_tarball(tar_name):
         sys.exit("Could not figure out version from directory "
                  "inside tarball: " + tar.firstmember.name)
     finally:
-        tar.close()
+        if tar is not None:
+            tar.close()
 
 
 def get_commit_from_spec(package):
