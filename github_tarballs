@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 #
 # Copyright 2012 SUSE Linux
+# (C) 2018 by Christian Wittmer <chris@computersalat.de>
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,21 +15,227 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from __future__ import print_function
+
 import argparse
 from datetime import datetime
 import glob
 import json
 import os
 import re
+import shutil
 import sys
 import tarfile
+import zipfile
 import urllib
+import codecs
 
+try:
+    from packaging.version import LegacyVersion, Version, parse
+except ImportError as exc:
+    HAS_PACKAGING = False
+    import warnings
+    warnings.warn("install 'packaging' to improve python package versions",
+                  RuntimeWarning)
+else:
+    HAS_PACKAGING = True
+
+
+DEBUG = False
 
 GITHUB_CREDS = ".github_tarballs_credentials"
 COMMIT_HASH_SIZE = 7
-GITHUB_COMPARE = ("https://%(creds)sapi.github.com/repos/"
+GITHUB_COMPARE = ("https://%(creds)s%(api)s/repos/"
                   "%(owner)s/%(repo)s/compare/%(base)s...%(head)s")
+GITHUB_GET_LATEST_RELEASE = ("https://%(creds)s%(api)s/repos/"
+                             "%(owner)s/%(repo)s/releases/latest")
+GITHUB_GET_LATEST_TARBALL = ("%(repourl)s/archive/"
+                             "%(version)s/%(repo)s-%(version)s.tar.gz")
+GITHUB_GET_TAGS = ("https://%(creds)s%(api)s/repos/"
+                   "%(owner)s/%(repo)s/tags")
+
+outdir = None
+suffixes = ('obscpio', 'tar', 'tar.gz', 'tgz', 'tar.bz2', 'tbz2', 'tar.xz',
+            'zip')
+suffixes_re = "|".join(map(lambda x: re.escape(x), suffixes))
+
+
+def _get_local_files():
+    """ sorted local file list by modification time (newest first)"""
+    files = glob.glob('*')
+    files.sort(key=lambda x: os.stat(os.path.join(os.getcwd(), x)).st_mtime,
+               reverse=True)
+    return files
+
+
+class VersionDetector(object):
+    def __init__(self, regex=None, file_list=(), basename=''):
+        self.regex = regex
+        self.file_list = file_list
+        self.basename = basename
+
+    def autodetect(self):
+        if DEBUG:
+            sys.stdout.write('\n ... {}'.format('starting version autodetect ...\n\n'))
+
+        version = self._get_version_via_obsinfo()
+        if not version:
+            if DEBUG:
+                sys.stdout.write('     {}'.format('unable to find version via obsinfo\n'))
+            version = self._get_version_via_spec()
+        if not version:
+            if DEBUG:
+                sys.stdout.write('     {}'.format('unable to find version via spec\n'))
+            version = self._get_version_via_archive_dirname()
+        if not version:
+            if DEBUG:
+                sys.stdout.write('     {}'.format('unable to find version via archive dirname\n'))
+            version = self._get_version_via_filename()
+        if not version:
+            if DEBUG:
+                sys.stdout.write('     {}'.format('unable to find version via filename\n'))
+        return version
+
+    def _get_version_via_filename(self):
+        """ detect version based on file names"""
+        if DEBUG:
+            print("detecting version via files")
+        for f in self.file_list:
+            if DEBUG:
+                print("  - checking file ", f)
+            if self.regex:
+                if DEBUG:
+                    print("  - using regex: ", self.regex)
+                regex = self.regex
+            else:
+                regex = r"^%s.*[-_]([\d].*)\.(?:%s)$" % (
+                    re.escape(self.basename),
+                    suffixes_re)
+            m = re.match(regex, f)
+            if m:
+                return m.group(1)
+        # Nothing found
+        return None
+
+    def __get_version(self, str_list):
+        if self.regex:
+            regex = self.regex
+        else:
+            regex = "%s.*[-_]([\d][^\/]*).*" % self.basename
+
+        for s in str_list:
+            m = re.match(regex, s)
+            if m:
+                return m.group(1)
+        # Nothing found
+        return None
+
+    def _get_version_via_archive_dirname(self):
+        """ detect version based tar'd directory name"""
+        for f in filter(lambda x: x.endswith(suffixes), self.file_list):
+            # handle tarfiles
+            if tarfile.is_tarfile(f):
+                with tarfile.open(f) as tf:
+                    v = self.__get_version(tf.getnames())
+                    if v:
+                        return v
+            # handle zipfiles
+            if zipfile.is_zipfile(f):
+                with zipfile.ZipFile(f, 'r') as zf:
+                    v = self.__get_version(zf.namelist())
+                    if v:
+                        return v
+        # Nothing found
+        return None
+
+    def _get_version_via_spec(self):
+        join_suffix = self.basename + ".spec"
+        for fname in filter(lambda x: x.endswith(join_suffix), self.file_list):
+            if os.path.exists(fname):
+                with codecs.open(fname, 'r', 'utf8') as fp:
+                    for line in fp:
+                        if line.startswith("Version:"):
+                            string = line[9:]
+                            string = string.rstrip()
+                            string = string.strip()
+                            return string
+        # Nothing found
+        return None
+
+    def _get_version_via_obsinfo(self):
+        join_suffix = self.basename + ".obsinfo"
+        for fname in filter(lambda x: x.endswith(join_suffix), self.file_list):
+            if os.path.exists(fname):
+                with codecs.open(fname, 'r', 'utf8') as fp:
+                    for line in fp:
+                        if line.startswith("version: "):
+                            string = line[9:]
+                            string = string.rstrip()
+                            return string
+        # Nothing found
+        return None
+
+
+class PackageTypeDetector(object):
+    # pylint: disable=too-few-public-methods
+    @staticmethod
+    def _get_package_type(files):
+        pt_found = False
+        for f in filter(lambda x: x.endswith(suffixes), files):
+            pt_found = PackageTypeDetector._is_python(f)
+            if pt_found:
+                return "python"
+        # no package type found
+        return None
+
+    @staticmethod
+    def _is_python(f):
+        names = []
+        if tarfile.is_tarfile(f):
+            with tarfile.open(f) as tf:
+                names = tf.getnames()
+        if zipfile.is_zipfile(f):
+            with zipfile.ZipFile(f, 'r') as zf:
+                names = zf.namelist()
+        for n in map(lambda x: os.path.normpath(x), names):
+            if n.endswith("egg-info/PKG-INFO"):
+                return True
+        return False
+
+
+def _version_detect(varargs, files_local):
+    #vdetect = VersionDetector(varargs['regex'], files_local, varargs['basename'])
+    regex = None
+    basename = ''
+    vdetect = VersionDetector(regex, files_local, basename)
+    ver = vdetect.autodetect()
+    if DEBUG:
+        sys.stdout.write(' ... {:<27} {} {}'.format('found version: ', ver, '\n\n'))
+
+    return ver
+
+
+def _replace_tag(filename, tag, string):
+    # first, modify a copy of filename and then move it
+    with codecs.open(filename, 'r+', 'utf8') as f:
+        contents = f.read()
+        f.seek(0)
+        if filename.endswith("PKGBUILD") or filename.endswith("build.collax"):
+            contents_new, subs = re.subn(
+                r"^{tag}=.*".format(tag=tag),
+                r"{tag}={string}".format(tag=tag, string=string), contents,
+                flags=re.MULTILINE)
+        else:
+            # keep inline macros for rpm
+            contents_new, subs = re.subn(
+                r'^{tag}:([ \t\f\v]*)[^%\n\r]*'.format(tag=tag),
+                r'{tag}:\g<1>{string}'.format(
+                    tag=tag, string=string),
+                contents, flags=re.MULTILINE)
+        if subs > 0:
+            f.truncate()
+            f.write(contents_new)
+
 
 
 def github_credentials():
@@ -47,128 +254,93 @@ def github_credentials():
     return creds
 
 
-def download_tarball(url, filename):
+def download_tarball(repourl, version, repo, filename):
     """Download an upstream tarball
 
     :url: remote source of the tarball
     :filename: where to save the downloaded tarball
 
     """
+    url = GITHUB_GET_LATEST_TARBALL % dict(repourl=repourl,
+                                           version=version,
+                                           repo=repo)
+    if DEBUG:
+        sys.stdout.write('  {:<30} {} {}'.format('URL: ', url, '\n'))
+
     try:
+        if DEBUG:
+            sys.stdout.write('  {:<30} {} {}'.format('before urlretrieve: ', os.listdir('.'), '\n'))
         urllib.urlretrieve(url, filename)
+        if DEBUG:
+            sys.stdout.write('  {:<30} {} {}'.format('after urlretrieve: ', os.listdir('.'), '\n'))
+            sys.stdout.write('  {:<30} {} {}'.format('cwd: ', os.getcwd(), '\n'))
     except IOError as e:
         sys.exit(e)
 
 
-def get_parent_dir_and_version_from_tarball(tar_name):
-    tar = None
-    try:
-        tar = tarfile.open(tar_name)
-        parent_dir = tar.firstmember.name
-        version = parent_dir.rsplit('-', 1)[1]
-        return (parent_dir, version)
-    except IndexError:
-        sys.exit("Could not figure out version from directory "
-                 "inside tarball: " + tar.firstmember.name)
-    finally:
-        if tar is not None:
-            tar.close()
+def get_latest_release(owner, repo):
+    """Return the tag_name of latest published release for the repository
 
+    See https://developer.github.com/v3/repos/releases/#get-the-latest-release
 
-def get_commit_from_spec(package):
-    """Parse the spec's Version field for a previously set commit version
-
-    :package: name of the package
-
-    Returns None in case no commit could be read.
+    If you fail to get latest Release, then you need to create a Release either via API
+    or via WEBUI and bind this Release to the preferred tag.
 
     """
+    url = GITHUB_GET_LATEST_RELEASE % dict(owner=owner,
+                                           repo=repo,
+                                           creds=github_credentials(),
+                                           api=args.api)
     try:
-        f = open(package + '.spec')
-        return re.search(r'^Version:\s+.*\+git\.\d+\.(.*?)(\s+#.*)?$',
-                         f.read(), flags=re.MULTILINE).group(1)
-    except AttributeError:
-        return None
-    finally:
-        f.close()
+        res = urllib.urlopen(url)
+    except IOError as e:
+        sys.exit(e)
+
+    if res.code != 200:
+        sys.exit("Could not read latest relase from: \n  %s. \n  %s\n"
+                 "    If you fail to get Latest Release, then you need to create a Release\n"
+                 "    either via API or via WEBUI and bind this Release to the preferred tag."
+                 % (url, json.loads(res.read())['message']))
+
+    json_data = json.loads(res.read())
+    tag_name = json_data['tag_name']
+
+    return tag_name
 
 
-def package_version(git_compare, upstream_version):
-    try:
-        upstream_commit = git_compare['commits'][-1]
-    except IndexError:
-        upstream_commit = git_compare['base_commit']
+def get_sha_of_tag(owner, repo, version):
+    """Return the 'sha' commit hash of given tag version
 
-    sha = upstream_commit['sha'][:COMMIT_HASH_SIZE]
-
-    return '%s+git.%s.%s' % (upstream_version,
-                             datetime.now().strftime('%s'),
-                             sha)
-
-
-def update_spec_file(package_version, tarball_parent_dir, filename):
-    for specfile in glob.glob('./*.spec'):
-        try:
-            f = open(specfile, 'r+')
-            contents = f.read()
-            f.seek(0)
-            f.truncate()
-            contents = re.sub(r'\n((Version:\s+).*)\n',
-                              r'\n\g<2>%s\n' % package_version,
-                              contents, count=1)
-            contents = re.sub(r'\n((%setup\s+).*)\n',
-                              r'\n\g<2>-q -n %s\n' % tarball_parent_dir,
-                              contents, count=1)
-            contents = re.sub(r'\n((Source0?:\s+).*)\n',
-                              r'\n\g<2>%s\n' % filename,
-                              contents, count=1)
-            f.write(contents)
-        finally:
-            f.close()
-
-
-def create_changes(git_compare, package_version, email):
-    """Return a string with the new changes for the .changes file
-
-    :git_compare: JSON data from github commit compare
-    :package_version: release version string for the .changes file entry
-    :email: email address used for the .changes file entry
+    See https://developer.github.com/v3/repos/#list-tags
 
     """
-    timestamp = datetime.utcnow().strftime('%a %b %e %T UTC %Y')
-
-    if not git_compare['commits']:
-        return None
-
-    commits = "  + " + "\n  + ".join(
-        c['commit']['message'].split('\n')[0]
-        for c in git_compare['commits']
-        if not c['commit']['message'].startswith('Merge '))
-
-    message = ('- Update to version %(package_version)s:\n'
-               '%(commits)s\n') % locals()
-
-    change = (
-        '-----------------------------------'
-        '---------------------------------\n'
-        '%(timestamp)s - %(email)s\n'
-        '\n%(message)s\n' % locals())
-
-    return change
-
-
-def update_changes_file(package, changes):
+    url = GITHUB_GET_TAGS % dict(owner=owner,
+                                 repo=repo,
+                                 creds=github_credentials(),
+                                 api=args.api)
     try:
-        f = open(package + ".changes", "r+")
-        contents = f.read()
-        f.seek(0)
-        f.write(changes)
-        f.write(contents)
-    finally:
-        f.close()
+        res = urllib.urlopen(url)
+    except IOError as e:
+        sys.exit(e)
+
+    if res.code != 200:
+        sys.exit("Could not read tags from: \n  %s. \n  %s\n"
+                 % (url, json.loads(res.read())['message']))
+
+    json_data = json.loads(res.read())
+    for tag in json_data:
+        tag_name = tag[u'name']
+        tag_sha = tag['commit']['sha']
+        if DEBUG:
+            sys.stdout.write('  {:<30} {} {}'.format('tag: ', tag_name, '\n'))
+            sys.stdout.write('  {:<30} {} {}'.format('sha: ', tag_sha, '\n'))
+        if tag_name == version:
+            break
+
+    return tag_sha
 
 
-def get_changes(package, owner, repo, target):
+def _get_changes(package, owner, repo, target):
     """Return a dict of new commits from github compare
 
     See http://developer.github.com/v3/repos/commits/#compare-two-commits
@@ -186,11 +358,12 @@ def get_changes(package, owner, repo, target):
     }
 
     """
-    current_commit = get_commit_from_spec(package)
+    #current_commit = get_version_from_spec(package)
     url = GITHUB_COMPARE % dict(owner=owner,
                                 repo=repo,
                                 creds=github_credentials(),
-                                base=current_commit or target,
+                                api=args.api,
+                                base=current_version or target,
                                 head=target)
     try:
         res = urllib.urlopen(url)
@@ -206,9 +379,50 @@ def get_changes(package, owner, repo, target):
     return data
 
 
+def _create_changes(git_compare, version, email):
+    """Return a string with the new changes for the .changes file
+
+    :git_compare: JSON data from github commit compare
+    :version: latest release version string for the .changes file entry
+    :email: email address used for the .changes file entry
+
+    """
+    timestamp = datetime.utcnow().strftime('%a %b %e %T UTC %Y')
+
+    if not git_compare['commits']:
+        return None
+
+    commits = "  + " + "\n  + ".join(
+        c['commit']['message'].split('\n')[0]
+        for c in git_compare['commits']
+        if not c['commit']['message'].startswith('Merge '))
+
+    message = ('- Update to version %(version)s\n'
+               '%(commits)s\n') % locals()
+
+    change = (
+        '-----------------------------------'
+        '---------------------------------\n'
+        '%(timestamp)s - %(email)s\n'
+        '\n%(message)s\n' % locals())
+
+    return change
+
+
+def _update_changes_file(filename, changes):
+    # first, modify a copy of filename and then move it
+    with codecs.open(filename, 'r+', 'utf8') as f:
+        contents = f.read()
+        f.seek(0)
+        f.write(changes)
+        f.write(contents)
+
+
 def _check_filenames(*filenames):
     for filename in filenames:
         basename = os.path.basename(filename)
+        if DEBUG:
+            sys.stdout.write('  {:<30} {} {}'.format('basename: ', basename, '\n'))
         if os.path.abspath(filename) != os.path.abspath(basename):
             # no arbitrary filename, please
             sys.exit("%s: illegal filename" % filename)
@@ -216,41 +430,129 @@ def _check_filenames(*filenames):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Git Tarballs')
-    parser.add_argument('--url', required=True,
-                        help='upstream tarball URL to download')
-    parser.add_argument('--filename',
-                        help='where to save the downloaded tarball')
-    parser.add_argument('--package',
-                        help='the OBS package name')
-    parser.add_argument('--repo_owner',
-                        help='github repository owner')
-    parser.add_argument('--repo_name',
-                        help='github repository name')
-    parser.add_argument('--target',
-                        help='git repository target commit/ref to update to')
+    parser.add_argument('-v', action='store_true',
+                        help='increase verbosity level')
+    parser.add_argument('--repourl', required=True,
+                        help='upstream URL of the github repository')
     parser.add_argument('--email', required=True,
                         help="commit author's email (for the .changes file)")
+    parser.add_argument('--api',
+                        help='the github API URL, needed for github enterprise e.g. github.example.com/api/v3')
+#    parser.add_argument('--version',
+#                        help='version of tag to download')
+    parser.add_argument('--package',
+                        help='OBS package name')
+    parser.add_argument('--repo_owner',
+                        help='GitHub repository owner')
+    parser.add_argument('--repo_name',
+                        help='GitHub repository name')
     parser.add_argument('--outdir',
                         help='osc service parameter that does nothing')
     args = parser.parse_args()
+    varargs = vars(parser.parse_args())
 
-    if not args.filename:
-        args.filename = args.url.rsplit("/", 1)[1]
+    outdir = args.outdir
+
+    if args.v:
+        sys.stdout.write('\n ... {}'.format('running in DEBUG mode ...\n\n'))
+        DEBUG = True
+        sys.stdout.write('  {} {} {}'.format('args:', args, '\n\n'))
+        sys.stdout.write('  {} {} {}'.format('varargs:', varargs, '\n\n'))
+
+    if not outdir:
+        sys.stdout.write('  {}'.format('Error: no "outdir" specified, e.g. try --outdir /tmp\n'))
+        sys.exit(-1)
+
+    if not args.api:
+        args.api = args.repourl.rsplit('/')[2]
+        if re.search('github.com$', args.api):
+            args.api = 'api.github.com'
     if not args.package:
         args.package = os.getcwd().rsplit("/", 1)[1]
+    if not args.repo_owner:
+        args.repo_owner = args.repourl.rsplit('/')[3]
+    if not args.repo_name:
+        args.repo_name = args.repourl.rsplit('/')[4]
 
-    _check_filenames(args.filename, args.package)
+    if DEBUG:
+        sys.stdout.write('  {:<30} {} {}'.format('given API FQDN: ', args.api, '\n'))
+        sys.stdout.write('  {:<30} {} {}'.format('URL to GitHub repository: ', args.repourl, '\n'))
+        #sys.stdout.write('  {:<30} {} {}'.format('filename: ', args.filename, '\n'))
+        sys.stdout.write('  {:<30} {} {}'.format('package: ', args.package, '\n'))
+        sys.stdout.write('  {:<30} {} {}'.format('repo_owner: ', args.repo_owner, '\n'))
+        sys.stdout.write('  {:<30} {} {}'.format('repo_name: ', args.repo_name, '\n'))
 
-    download_tarball(args.url, args.filename)
+    ### get local files
+    files_local = _get_local_files()
 
-    tarball_parent_dir, upstream_version = \
-        get_parent_dir_and_version_from_tarball(args.filename)
+    ### detect version from local files
+    current_version = _version_detect(varargs, files_local)
 
-    git_compare = get_changes(args.package, args.repo_owner,
-                              args.repo_name, args.target)
-    current_version = package_version(git_compare, upstream_version)
+    # if no files explicitly specified process whole directory
+    files = files_local
 
-    changes = create_changes(git_compare, current_version, args.email)
+    # do version convertion if needed
+    pack_type = PackageTypeDetector._get_package_type(files)
+    version_converted = None
+    if pack_type == "python":
+        version_converted = _version_python_pip2rpm(version)
+
+    if not current_version:
+        print("unable to detect the version")
+        sys.exit(-1)
+    if DEBUG:
+        sys.stdout.write('  {:<30} {} {}'.format('current version: ', current_version, '\n'))
+
+    ### get latest release version
+    version = get_latest_release(args.repo_owner, args.repo_name)
+    if DEBUG:
+        sys.stdout.write('  {:<30} {} {}'.format('latest release version: ', version, '\n'))
+
+    ### create filename %{name}-%{version}.tar.gz
+    filename = args.repo_name + '-' + version + '.tar.gz'
+    if DEBUG:
+        sys.stdout.write('  {:<30} {} {}'.format('Latest Release tarbal name: ', filename, '\n'))
+
+    _check_filenames(filename, args.package)
+    if args.outdir:
+        filename = os.path.join(args.outdir, filename)
+
+    ### download tarball of latest release version
+    download_tarball(args.repourl, version, args.repo_name, filename)
+
+    ### get sha hash from latest tag
+    git_latest_tag_commit = get_sha_of_tag(args.repo_owner, args.repo_name, version)
+
+    ### get sha hash from previous tag (current version)
+    git_previous_tag_commit = get_sha_of_tag(args.repo_owner, args.repo_name, current_version)
+
+    ### compare both versions
+    git_compare = _get_changes(args.package, args.repo_owner,
+                              args.repo_name, git_latest_tag_commit)
+
+    ### update spec and changes file when there are changes
+    changes = _create_changes(git_compare, version, args.email)
     if changes:
-        update_changes_file(args.package, changes)
-        update_spec_file(current_version, tarball_parent_dir, args.filename)
+        sys.stdout.write('\n ... {}'.format('changes found ...\n\n'))
+
+        #update_spec_file(args.repourl, version, args.repo_owner)
+        ### handle rpm specs
+        for f in filter(lambda x: x.endswith(".spec"), files):
+            filename = outdir + "/" + f
+            shutil.copyfile(f, filename)
+            #_replace_define(filename, "version_unconverted", version,
+            #                add_if_missing=False)
+            if version_converted and version_converted != version:
+            #    _replace_define(filename, "version_unconverted", version)
+                _replace_tag(filename, 'Version', version_converted)
+            #    _replace_spec_setup(filename, "version_unconverted")
+            else:
+                _replace_tag(filename, 'Version', version)
+            _replace_tag(filename, 'Release', "0")
+
+        #update_changes_file(args.package, changes)
+        ### handle obs changes file
+        for f in filter(lambda x: x.endswith(".changes"), files):
+            filename = outdir + "/" + f
+            shutil.copyfile(f, filename)
+            _update_changes_file(filename, changes)
