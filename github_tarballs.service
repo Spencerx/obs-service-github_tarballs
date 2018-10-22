@@ -1,30 +1,29 @@
 <service name="github_tarballs">
-  <summary>Download tarballs and update package data</summary>
-  <description>This service downloads tarballs and updates the spec file version and changes file</description>
-  <param name="url">
-    <description>URL of the tarball to download.</description>
+  <summary>Download latest release tarball and update package data</summary>
+  <description>This service downloads the latest release tarball found on GitHub repository and updates the spec file version and changes file.
+When you create a tag and upload to your GitHub repository you should also create a Release based on this tag.
+Without having Releases this service will not work cause GitHub API only offers the ability to get 'latest release' but not 'latest tag'.
+  </description>
+  <parameter name="repourl">
+    <description>upstream URL of the github repository.</description>
     <required/>
-  </param>
-  <param name="package">
-    <description>OBS package name.</description>
-  </param>
-  <param name="filename">
-    <description>Name of the filename where the tarball will be downloaded.</description>
-  </param>
-  <param name="email">
+  </parameter>
+  <parameter name="email">
     <description>User's email that will be used to sign the rpm's .changes file</description>
     <required/>
-  </param>
-  <param name="repo_owner">
+  </parameter>
+  <parameter name="api">
+    <description>The github API URL, needed for github enterprise, e.g. github.example.com/api/v3 </description>
+  </parameter>
+  <parameter name="package">
+    <description>OBS package name.</description>
+  </parameter>
+  <parameter name="repo_owner">
     <description>GitHub repository owner</description>
     <required/>
-  </param>
-  <param name="repo_name">
+  </parameter>
+  <parameter name="repo_name">
     <description>GitHub repository name</description>
     <required/>
-  </param>
-  <param name="target">
-    <description>A commit or git reference that will be the target to sync up to from the upstream repository</description>
-    <required/>
-  </param>
+  </parameter>
 </service>
