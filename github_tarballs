@@ -27,7 +27,7 @@ import shutil
 import sys
 import tarfile
 import zipfile
-import urllib
+import urllib2
 import codecs
 
 try:
@@ -270,7 +270,12 @@ def download_tarball(repourl, version, repo, filename):
     try:
         if DEBUG:
             sys.stdout.write('  {:<30} {} {}'.format('before urlretrieve: ', os.listdir('.'), '\n'))
-        urllib.urlretrieve(url, filename)
+
+        res = urllib2.urlopen(url)
+        local_file = open(filename, 'wb')
+        local_file.write(res.read())
+        local_file.close()
+
         if DEBUG:
             sys.stdout.write('  {:<30} {} {}'.format('after urlretrieve: ', os.listdir('.'), '\n'))
             sys.stdout.write('  {:<30} {} {}'.format('cwd: ', os.getcwd(), '\n'))
@@ -292,7 +297,7 @@ def get_latest_release(owner, repo):
                                            creds=github_credentials(),
                                            api=args.api)
     try:
-        res = urllib.urlopen(url)
+        res = urllib2.urlopen(url)
     except IOError as e:
         sys.exit(e)
 
@@ -319,7 +324,7 @@ def get_sha_of_tag(owner, repo, version):
                                  creds=github_credentials(),
                                  api=args.api)
     try:
-        res = urllib.urlopen(url)
+        res = urllib2.urlopen(url)
     except IOError as e:
         sys.exit(e)
 
@@ -366,7 +371,7 @@ def _get_changes(package, owner, repo, target):
                                 base=current_version or target,
                                 head=target)
     try:
-        res = urllib.urlopen(url)
+        res = urllib2.urlopen(url)
     except IOError as e:
         sys.exit(e)
 
